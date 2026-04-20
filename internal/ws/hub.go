@@ -1,0 +1,189 @@
+package ws
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"sync"
+
+	"github.com/Tanish431/worduel/internal/models"
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+)
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+type Client struct {
+	hub     *Hub
+	conn    *websocket.Conn
+	send    chan []byte
+	UserID  uuid.UUID
+	MatchID uuid.UUID
+}
+
+type Hub struct {
+	mu         sync.RWMutex
+	rooms      map[uuid.UUID][]*Client
+	register   chan *Client
+	unregister chan *Client
+	broadcast  chan roomMsg
+	jwtSecret  string
+}
+
+type roomMsg struct {
+	matchID uuid.UUID
+	data    []byte
+}
+
+func NewHub(jwtSecret string) *Hub {
+	return &Hub{
+		rooms:      make(map[uuid.UUID][]*Client),
+		register:   make(chan *Client, 64),
+		unregister: make(chan *Client, 64),
+		broadcast:  make(chan roomMsg, 256),
+		jwtSecret:  jwtSecret,
+	}
+}
+
+func (h *Hub) Run() {
+	for {
+		select {
+		case c := <-h.register:
+			h.mu.Lock()
+			h.rooms[c.MatchID] = append(h.rooms[c.MatchID], c)
+			h.mu.Unlock()
+		case c := <-h.unregister:
+			h.mu.Lock()
+			clients := h.rooms[c.MatchID]
+			for i, cl := range clients {
+				if cl == c {
+					h.rooms[c.MatchID] = append(clients[:i], clients[i+1:]...)
+					close(c.send)
+					break
+				}
+			}
+			h.mu.Unlock()
+		case msg := <-h.broadcast:
+			h.mu.RLock()
+			for _, c := range h.rooms[msg.matchID] {
+				select {
+				case c.send <- msg.data:
+				default:
+					close(c.send)
+				}
+			}
+			h.mu.RUnlock()
+		}
+	}
+}
+
+func (h *Hub) SendToMatch(matchID uuid.UUID, event models.WSEvent) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("ws marshal error: %v", err)
+		return
+	}
+	h.broadcast <- roomMsg{matchID: matchID, data: data}
+}
+
+func (h *Hub) SendToUser(userID uuid.UUID, event models.WSEvent) {
+	data, _ := json.Marshal(event)
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, clients := range h.rooms {
+		for _, c := range clients {
+			if c.UserID == userID {
+				select {
+				case c.send <- data:
+				default:
+				}
+			}
+		}
+	}
+}
+
+func (h *Hub) SendToUserInMatch(matchID uuid.UUID, userID uuid.UUID, event models.WSEvent) {
+	data, _ := json.Marshal(event)
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, c := range h.rooms[matchID] {
+		if c.UserID != userID {
+			continue
+		}
+		select {
+		case c.send <- data:
+		default:
+		}
+	}
+}
+
+func (h *Hub) HandleConnect(c *gin.Context) {
+	// Extract user ID from JWT token in query param
+	tokenStr := c.Query("token")
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
+		return []byte(h.jwtSecret), nil
+	}, jwt.WithValidMethods([]string{"HS256"}))
+	if err != nil || !token.Valid {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	userID, err := uuid.Parse(claims["sub"].(string))
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	matchID, err := uuid.Parse(c.Query("match_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid match_id"})
+		return
+	}
+
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Printf("ws upgrade: %v", err)
+		return
+	}
+
+	client := &Client{
+		hub:     h,
+		conn:    conn,
+		send:    make(chan []byte, 256),
+		UserID:  userID,
+		MatchID: matchID,
+	}
+
+	h.register <- client
+	go client.writePump()
+	go client.readPump()
+}
+
+func (c *Client) writePump() {
+	defer c.conn.Close()
+	for data := range c.send {
+		if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			break
+		}
+	}
+}
+
+func (c *Client) readPump() {
+	defer func() {
+		c.hub.unregister <- c
+		c.conn.Close()
+	}()
+	for {
+		if _, _, err := c.conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+}

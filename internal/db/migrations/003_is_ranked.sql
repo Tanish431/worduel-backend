@@ -1,0 +1,1 @@
+ALTER TABLE matches ADD COLUMN is_ranked BOOLEAN NOT NULL DEFAULT true;
