@@ -35,6 +35,16 @@ func (s *Service) HandleChallenge(c *gin.Context) {
 		return
 	}
 
+	rateLimitKey := "challenge_rate:" + challengerID.String()
+	count, _ := s.rdb.Incr(c.Request.Context(), rateLimitKey).Result()
+	if count == 1 {
+		s.rdb.Expire(c.Request.Context(), rateLimitKey, time.Minute)
+	}
+	if count > 3 {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many challenges, slow down"})
+		return
+	}
+
 	username := c.Param("username")
 
 	var targetID uuid.UUID
