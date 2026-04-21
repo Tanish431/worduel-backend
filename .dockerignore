@@ -1,0 +1,4 @@
+.env
+seed/
+migrate/
+*.md
