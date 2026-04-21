@@ -30,7 +30,7 @@ func main() {
 	hub := ws.NewHub(cfg.JWTSecret)
 	wordSvc := word.NewService(db)
 	gameSvc := game.NewService(db, wordSvc, hub)
-	authSvc := auth.NewService(db, cfg.JWTSecret)
+	authSvc := auth.NewService(db, cfg)
 	mmSvc := matchmaking.NewService(db, rdb, hub, wordSvc, gameSvc)
 	roomSvc := room.NewService(db, hub, wordSvc, mmSvc)
 	lbSvc := leaderboard.NewService(db)
@@ -60,6 +60,8 @@ func main() {
 	{
 		api.POST("/auth/register", authSvc.HandleRegister)
 		api.POST("/auth/login", authSvc.HandleLogin)
+		api.GET("/auth/google", authSvc.HandleGoogleLogin)
+		api.GET("/auth/google/callback", authSvc.HandleGoogleCallback)
 	}
 
 	protected := r.Group("/api")

@@ -10,20 +10,26 @@ import (
 )
 
 type Config struct {
-	Port           string
-	DatabaseURL    string
-	RedisUrl       string
-	JWTSecret      string
-	FrontendOrigin string
+	Port               string
+	DatabaseURL        string
+	RedisUrl           string
+	JWTSecret          string
+	FrontendOrigin     string
+	GoogleClientID     string
+	GoogleClientSecret string
+	GoogleRedirectURL  string
 }
 
 func Load() *Config {
 	return &Config{
-		Port:           getEnv("PORT", "8080"),
-		DatabaseURL:    getEnv("DATABASE_URL", "postgres://worduel:worduel@localhost:5432/worduel"),
-		RedisUrl:       getEnv("REDIS_URL", "redis://localhost:6379"),
-		JWTSecret:      getEnv("JWT_SECRET", "change-me-in-prod"),
-		FrontendOrigin: getEnv("FRONTEND_ORIGIN", "http://localhost:5173"),
+		Port:               getEnv("PORT", "8080"),
+		DatabaseURL:        getEnv("DATABASE_URL", "postgres://worduel:worduel@localhost:5432/worduel"),
+		RedisUrl:           getEnv("REDIS_URL", "redis://localhost:6379"),
+		JWTSecret:          getEnv("JWT_SECRET", "change-me-in-prod"),
+		FrontendOrigin:     getEnv("FRONTEND_ORIGIN", "http://localhost:5173"),
+		GoogleClientID:     getEnv("GOOGLE_CLIENT_ID", ""),
+		GoogleClientSecret: getEnv("GOOGLE_CLIENT_SECRET", ""),
+		GoogleRedirectURL:  getEnv("GOOGLE_REDIRECT_URL", "http://localhost:8080/api/auth/google/callback"),
 	}
 }
 
