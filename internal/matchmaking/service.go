@@ -119,7 +119,9 @@ func (s *Service) matchPlayers(ctx context.Context) {
 }
 
 func (s *Service) createMatch(ctx context.Context, playerAID, playerBID uuid.UUID) {
+	log.Printf("creating match: %s vs %s", playerAID, playerBID)
 	matchID := uuid.New()
+	startIdx := rand.IntN(1000)
 
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO matches
@@ -127,12 +129,13 @@ func (s *Service) createMatch(ctx context.Context, playerAID, playerBID uuid.UUI
 		  player_a_word_idx, player_b_word_idx, is_ranked, started_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		matchID, playerAID, playerBID, models.MatchActive,
-		models.StartingHP, models.StartingHP, 0, 0, true, time.Now(),
+		models.StartingHP, models.StartingHP, startIdx, startIdx, true, time.Now(),
 	)
 	if err != nil {
-		log.Printf("create match: %v", err)
+		log.Printf("create match error: %v", err)
 		return
 	}
+	log.Printf("match created: %s", matchID)
 
 	s.hub.SendToUser(playerAID, models.WSEvent{
 		Type: models.EventMatchFound,
