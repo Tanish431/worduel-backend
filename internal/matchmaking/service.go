@@ -90,6 +90,7 @@ func (s *Service) RunQueue(ctx context.Context) {
 
 func (s *Service) matchPlayers(ctx context.Context) {
 	entries, err := s.rdb.ZRangeWithScores(ctx, queueKey, 0, -1).Result()
+	log.Printf("queue tick: %d players, err=%v", len(entries), err)
 	if err != nil || len(entries) < 2 {
 		return
 	}
@@ -97,7 +98,9 @@ func (s *Service) matchPlayers(ctx context.Context) {
 	for i := 0; i < len(entries)-1; i++ {
 		a := entries[i]
 		b := entries[i+1]
+		log.Printf("checking pair: %v (%.0f) vs %v (%.0f)", a.Member, a.Score, b.Member, b.Score)
 		if !elo.WithinRange(int(a.Score), int(b.Score), initialELORange) {
+			log.Printf("elo range exceeded, skipping")
 			continue
 		}
 
@@ -105,6 +108,7 @@ func (s *Service) matchPlayers(ctx context.Context) {
 		playerBID, _ := uuid.Parse(b.Member.(string))
 
 		removed, err := s.rdb.ZRem(ctx, queueKey, a.Member, b.Member).Result()
+		log.Printf("zrem result: removed=%d err=%v", removed, err)
 		if err != nil || removed != 2 {
 			continue
 		}
