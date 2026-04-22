@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -34,7 +35,12 @@ func Load() *Config {
 }
 
 func (c *Config) MustConnectDB() *pgxpool.Pool {
-	pool, err := pgxpool.New(context.Background(), c.DatabaseURL)
+	config, err := pgxpool.ParseConfig(c.DatabaseURL)
+	if err != nil {
+		log.Fatalf("parse db config: %v", err)
+	}
+	config.ConnConfig.ConnectTimeout = 10 * time.Second
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
 		log.Fatalf("connect db: %v", err)
 	}
@@ -46,6 +52,9 @@ func (c *Config) MustConnectRedis() *redis.Client {
 	if err != nil {
 		log.Fatalf("parse redis url: %v", err)
 	}
+	opts.DialTimeout = 10 * time.Second
+	opts.ReadTimeout = 10 * time.Second
+	opts.WriteTimeout = 10 * time.Second
 	return redis.NewClient(opts)
 }
 
