@@ -94,9 +94,13 @@ func (h *Hub) SendToUser(userID uuid.UUID, event models.WSEvent) {
 	data, _ := json.Marshal(event)
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for _, clients := range h.rooms {
+	log.Printf("SendToUser: looking for %s in %d rooms", userID, len(h.rooms))
+	found := false
+	for roomID, clients := range h.rooms {
 		for _, c := range clients {
+			log.Printf("  room %s has client %s", roomID, c.UserID)
 			if c.UserID == userID {
+				found = true
 				select {
 				case c.send <- data:
 				default:
@@ -104,6 +108,7 @@ func (h *Hub) SendToUser(userID uuid.UUID, event models.WSEvent) {
 			}
 		}
 	}
+	log.Printf("SendToUser: found=%v for %s", found, userID)
 }
 
 func (h *Hub) SendToUserInMatch(matchID uuid.UUID, userID uuid.UUID, event models.WSEvent) {
