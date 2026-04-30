@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,6 +30,7 @@ const (
 	googleUserInfoURL = "https://openidconnect.googleapis.com/v1/userinfo"
 	localProvider     = "local"
 	googleProvider    = "google"
+	guestProvider     = "guest"
 )
 
 type Service struct {
@@ -38,6 +41,10 @@ type Service struct {
 	googleClientSecret string
 	googleRedirectURL  string
 	httpClient         *http.Client
+}
+
+type updateUsernameRequest struct {
+	Username string `json:"username" binding:"required,min=3,max=20"`
 }
 
 func NewService(db *pgxpool.Pool, cfg *config.Config) *Service {
@@ -79,6 +86,10 @@ type googleUserInfo struct {
 type googleStateClaims struct {
 	RedirectURI string `json:"redirect_uri"`
 	jwt.RegisteredClaims
+}
+
+type guestRequest struct {
+	DeviceID string `json:"device_id" binding:"required"`
 }
 
 func (s *Service) HandleRegister(c *gin.Context) {
@@ -158,6 +169,75 @@ func (s *Service) HandleLogin(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"token": token, "user": user})
+}
+
+func (s *Service) HandleGuestLogin(c *gin.Context) {
+	var req guestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var user models.User
+	err := s.db.QueryRow(c.Request.Context(),
+		`SELECT id, username, email, auth_provider, elo, is_guest, created_at
+		 FROM users WHERE device_id=$1 AND auth_provider='guest'`,
+		req.DeviceID,
+	).Scan(&user.ID, &user.Username, &user.Email, &user.AuthProvider,
+		&user.ELO, &user.IsGuest, &user.CreatedAt)
+
+	if err == nil {
+		token, err := s.issueToken(user.ID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"token": token, "user": user})
+		return
+	}
+
+	guestID := uuid.New()
+	username := fmt.Sprintf("Guest#%s", strings.ToUpper(guestID.String()[:5]))
+	for {
+		var exists bool
+		s.db.QueryRow(c.Request.Context(),
+			`SELECT EXISTS(SELECT 1 FROM users WHERE username=$1)`, username,
+		).Scan(&exists)
+		if !exists {
+			break
+		}
+		newID := uuid.New()
+		username = fmt.Sprintf("Guest#%s", strings.ToUpper(newID.String()[:5]))
+	}
+	user = models.User{
+		ID:           uuid.New(),
+		Username:     username,
+		Email:        "",
+		AuthProvider: guestProvider,
+		ELO:          0,
+		IsGuest:      true,
+		CreatedAt:    time.Now(),
+	}
+	guestEmail := fmt.Sprintf("guest_%s@guest.local", req.DeviceID)
+
+	_, err = s.db.Exec(c.Request.Context(),
+		`INSERT INTO users (id, username, email, password_hash, auth_provider, device_id, elo, is_guest, created_at)
+     	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		user.ID, user.Username, guestEmail, "", guestProvider, req.DeviceID, 0, true, user.CreatedAt,
+	)
+	if err != nil {
+		log.Printf("guest insert error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create guest"})
+		return
+	}
+	token, err := s.issueToken(user.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"token": token, "user": user})
+
 }
 
 func (s *Service) HandleGoogleLogin(c *gin.Context) {
@@ -357,6 +437,8 @@ func (s *Service) exchangeGoogleCode(ctx context.Context, code string) (*googleT
 	defer res.Body.Close()
 
 	if res.StatusCode >= 400 {
+		body, _ := io.ReadAll(res.Body)
+		log.Printf("google token exchange error: status=%d body=%s", res.StatusCode, string(body))
 		return nil, fmt.Errorf("google token exchange failed with status %d", res.StatusCode)
 	}
 
@@ -519,4 +601,39 @@ func (s *Service) buildFrontendErrorRedirect(frontendRedirectURI, message string
 	query.Set("error", message)
 	redirectURL.RawQuery = query.Encode()
 	return redirectURL.String()
+}
+
+func (s *Service) HandleUpdateUsername(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	var req updateUsernameRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if strings.HasPrefix(strings.ToLower(req.Username), "guest#") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid username"})
+		return
+	}
+
+	username := sanitizeUsername(req.Username)
+	if len(username) < 3 || len(username) > 20 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "username must be 3-20 characters"})
+		return
+	}
+
+	_, err := s.db.Exec(c.Request.Context(),
+		`UPDATE users SET username=$1 WHERE id=$2`, username, userID,
+	)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "username already taken"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"username": username})
 }

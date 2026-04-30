@@ -2,7 +2,6 @@ package game
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"github.com/Tanish431/worduel/internal/models"
@@ -12,7 +11,14 @@ import (
 const drainInterval = time.Second
 
 func (s *Service) StartDrain(ctx context.Context, matchID uuid.UUID) {
-	ticker := time.NewTicker(drainInterval)
+	var gameMode string
+	s.db.QueryRow(ctx, `SELECT game_mode FROM matches WHERE id=$1`, matchID).Scan(&gameMode)
+
+	drainEvery := time.Duration(models.HardDrainEvery) * time.Second
+	if gameMode == models.GameModeEasy {
+		drainEvery = time.Duration(models.EasyDrainEvery) * time.Second
+	}
+	ticker := time.NewTicker(drainEvery)
 	defer ticker.Stop()
 
 	for {
@@ -37,7 +43,6 @@ func (s *Service) drainTick(ctx context.Context, matchID uuid.UUID) bool {
 		&match.PlayerAHP, &match.PlayerBHP)
 
 	if err != nil {
-		log.Printf("drain tick fetch: %v", err)
 		return true
 	}
 
@@ -53,7 +58,6 @@ func (s *Service) drainTick(ctx context.Context, matchID uuid.UUID) bool {
 		newAHP, newBHP, matchID,
 	)
 	if err != nil {
-		log.Printf("drain tick update: %v", err)
 		return true
 	}
 
@@ -66,7 +70,8 @@ func (s *Service) drainTick(ctx context.Context, matchID uuid.UUID) bool {
 	})
 
 	if newAHP <= 0 && newBHP <= 0 {
-		go s.resolveMatch(ctx, &match, nil)
+		winner := s.tiebreaker(ctx, matchID, match.PlayerAID, match.PlayerBID)
+		go s.resolveMatch(ctx, &match, winner)
 		return true
 	}
 	if newAHP <= 0 {

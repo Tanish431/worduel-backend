@@ -3,8 +3,10 @@ package game
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Tanish431/worduel/internal/middleware"
@@ -39,12 +41,21 @@ func (s *Service) HandleGetMatch(c *gin.Context) {
 	var match models.Match
 	err = s.db.QueryRow(c.Request.Context(),
 		`SELECT id, player_a_id, player_b_id, status, winner_id, player_a_hp, player_b_hp,
-		player_a_word_idx, player_b_word_idx, is_ranked, started_at, finished_at FROM matches WHERE id=$1`, matchID,
+	player_a_word_idx, player_b_word_idx, is_ranked, game_mode, started_at, finished_at FROM matches WHERE id=$1`, matchID,
 	).Scan(&match.ID, &match.PlayerAID, &match.PlayerBID, &match.Status, &match.WinnerID,
 		&match.PlayerAHP, &match.PlayerBHP, &match.PlayerAWordIdx, &match.PlayerBWordIdx, &match.IsRanked,
-		&match.StartedAt, &match.FinishedAt)
+		&match.GameMode, &match.StartedAt, &match.FinishedAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "match not found"})
+		return
+	}
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	if userID != match.PlayerAID && userID != match.PlayerBID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "not a participant"})
 		return
 	}
 	c.JSON(http.StatusOK, match)
@@ -63,12 +74,12 @@ type matchSummaryPlayer struct {
 }
 
 type matchSummaryResponse struct {
-	MatchID   uuid.UUID            `json:"match_id"`
-	IsRanked  bool                 `json:"is_ranked"`
-	WinnerID  *uuid.UUID           `json:"winner_id,omitempty"`
-	PlayerA   matchSummaryPlayer   `json:"player_a"`
-	PlayerB   matchSummaryPlayer   `json:"player_b"`
-	Rounds    []matchSummaryRound  `json:"rounds"`
+	MatchID  uuid.UUID           `json:"match_id"`
+	IsRanked bool                `json:"is_ranked"`
+	WinnerID *uuid.UUID          `json:"winner_id,omitempty"`
+	PlayerA  matchSummaryPlayer  `json:"player_a"`
+	PlayerB  matchSummaryPlayer  `json:"player_b"`
+	Rounds   []matchSummaryRound `json:"rounds"`
 }
 
 func (s *Service) HandleGetMatchSummary(c *gin.Context) {
@@ -220,6 +231,7 @@ func (s *Service) HandleSubmitGuess(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "guess must be 5 letters"})
 		return
 	}
+	req.Guess = strings.ToLower(req.Guess)
 
 	if !s.wordSvc.IsValidGuess(c.Request.Context(), req.Guess) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "not in word list"})
@@ -229,11 +241,11 @@ func (s *Service) HandleSubmitGuess(c *gin.Context) {
 	var match models.Match
 	err = s.db.QueryRow(c.Request.Context(),
 		`SELECT id, player_a_id, player_b_id, status,
-		        player_a_hp, player_b_hp, player_a_word_idx, player_b_word_idx
-		 FROM matches WHERE id=$1`, matchID,
+	player_a_hp, player_b_hp, player_a_word_idx, player_b_word_idx, game_mode
+	FROM matches WHERE id=$1`, matchID,
 	).Scan(
 		&match.ID, &match.PlayerAID, &match.PlayerBID, &match.Status,
-		&match.PlayerAHP, &match.PlayerBHP, &match.PlayerAWordIdx, &match.PlayerBWordIdx,
+		&match.PlayerAHP, &match.PlayerBHP, &match.PlayerAWordIdx, &match.PlayerBWordIdx, &match.GameMode,
 	)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "match not found"})
@@ -257,6 +269,62 @@ func (s *Service) HandleSubmitGuess(c *gin.Context) {
 		wordIdx = match.PlayerBWordIdx
 		myHP = match.PlayerBHP
 		opponentID = match.PlayerAID
+	}
+	var alreadyGuessed bool
+	s.db.QueryRow(c.Request.Context(),
+		`SELECT EXISTS(
+		SELECT 1 FROM guesses
+		WHERE match_id=$1 AND player_id=$2 AND word_index=$3 AND guess=$4
+	)`,
+		matchID, userID, wordIdx, strings.ToLower(req.Guess),
+	).Scan(&alreadyGuessed)
+
+	if alreadyGuessed {
+		c.JSON(http.StatusConflict, gin.H{"error": "you already tried that word"})
+		return
+	}
+
+	if match.GameMode == models.GameModeHard {
+		rows, err := s.db.Query(c.Request.Context(),
+			`SELECT id, match_id, player_id, word_index, guess, result, guessed_at
+			 FROM guesses
+			 WHERE match_id=$1 AND player_id=$2 AND word_index=$3
+			 ORDER BY guessed_at ASC`,
+			matchID, userID, wordIdx,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load previous guesses"})
+			return
+		}
+		defer rows.Close()
+
+		previousGuesses := make([]models.Guess, 0)
+		for rows.Next() {
+			var previousGuess models.Guess
+			var rawResult []byte
+			if err := rows.Scan(
+				&previousGuess.ID,
+				&previousGuess.MatchID,
+				&previousGuess.PlayerID,
+				&previousGuess.WordIndex,
+				&previousGuess.Guess,
+				&rawResult,
+				&previousGuess.GuessedAt,
+			); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to scan previous guesses"})
+				return
+			}
+			if err := json.Unmarshal(rawResult, &previousGuess.Result); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse previous guesses"})
+				return
+			}
+			previousGuesses = append(previousGuesses, previousGuess)
+		}
+
+		if err := validateHardMode(req.Guess, previousGuesses); err != nil {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	currentWord := s.wordSvc.GetWordAtIndex(c.Request.Context(), wordIdx)
@@ -289,7 +357,7 @@ func (s *Service) HandleSubmitGuess(c *gin.Context) {
 
 	s.hub.SendToUserInMatch(matchID, opponentID, models.WSEvent{
 		Type:    models.EventOpponentGuess,
-		Payload: guess,
+		Payload: map[string]any{"result": result},
 	})
 
 	solved := req.Guess == currentWord
@@ -402,10 +470,25 @@ func (s *Service) HandleSubmitGuess(c *gin.Context) {
 			currentMyHP = updatedBHP
 		}
 
-		s.db.Exec(c.Request.Context(),
-			`DELETE FROM guesses WHERE match_id=$1 AND player_id=$2 AND word_index=$3`,
-			matchID, userID, wordIdx,
-		)
+		nextWordIdx := wordIdx + 1
+		if isPlayerA {
+			s.db.Exec(c.Request.Context(),
+				`UPDATE matches SET player_a_word_idx=$1 WHERE id=$2`, nextWordIdx, matchID)
+		} else {
+			s.db.Exec(c.Request.Context(),
+				`UPDATE matches SET player_b_word_idx=$1 WHERE id=$2`, nextWordIdx, matchID)
+		}
+
+		nextWord := s.wordSvc.GetWordAtIndex(c.Request.Context(), nextWordIdx)
+		s.hub.SendToUser(userID, models.WSEvent{
+			Type: "guess_reset",
+			Payload: map[string]any{
+				"reset":            true,
+				"my_hp":            newMyHP,
+				"next_word_index":  nextWordIdx,
+				"next_word_length": len(nextWord),
+			},
+		})
 
 		s.hub.SendToUserInMatch(matchID, userID, models.WSEvent{
 			Type:    models.EventHPUpdate,
@@ -571,11 +654,48 @@ func (s *Service) resolveMatch(ctx context.Context, match *models.Match, winnerI
 	}
 }
 
-func (s *Service) checkDeath(ctx context.Context, match *models.Match, myHP, opponentHP int, myID, opponenID uuid.UUID) {
+func (s *Service) tiebreaker(ctx context.Context, matchID, playerAID, playerBID uuid.UUID) *uuid.UUID {
+	correctTiles := func(playerID uuid.UUID) int {
+		rows, err := s.db.Query(ctx,
+			`SELECT result FROM guesses WHERE match_id=$1 AND player_id=$2`,
+			matchID, playerID,
+		)
+		if err != nil {
+			return 0
+		}
+		defer rows.Close()
+		count := 0
+		for rows.Next() {
+			var result []models.TileResult
+			if err := rows.Scan(&result); err != nil {
+				continue
+			}
+			for _, r := range result {
+				if r == models.TileCorrect {
+					count++
+				}
+			}
+		}
+		return count
+	}
+
+	aScore := correctTiles(playerAID)
+	bScore := correctTiles(playerBID)
+
+	if aScore > bScore {
+		return &playerAID
+	} else if bScore > aScore {
+		return &playerBID
+	}
+	return nil // Draw
+}
+
+func (s *Service) checkDeath(ctx context.Context, match *models.Match, myHP, opponentHP int, myID, opponentID uuid.UUID) {
 	if myHP <= 0 && opponentHP <= 0 {
-		go s.resolveMatch(ctx, match, nil)
+		winner := s.tiebreaker(ctx, match.ID, match.PlayerAID, match.PlayerBID)
+		go s.resolveMatch(ctx, match, winner)
 	} else if myHP <= 0 {
-		go s.resolveMatch(ctx, match, &opponenID)
+		go s.resolveMatch(ctx, match, &opponentID)
 	} else if opponentHP <= 0 {
 		go s.resolveMatch(ctx, match, &myID)
 	}
@@ -606,4 +726,23 @@ func scoreGuess(guess, target string) []models.TileResult {
 	}
 
 	return result
+}
+
+func validateHardMode(guess string, previousGuesses []models.Guess) error {
+	for _, prev := range previousGuesses {
+		for i, r := range prev.Result {
+			letter := string(prev.Guess[i])
+			switch r {
+			case models.TileCorrect:
+				if string(guess[i]) != letter {
+					return fmt.Errorf("must use '%s' in position %d", strings.ToUpper(letter), i+1)
+				}
+			case models.TilePresent:
+				if !strings.ContainsRune(guess, rune(letter[0])) {
+					return fmt.Errorf("must include '%s' somewhere in the guess", strings.ToUpper(letter))
+				}
+			}
+		}
+	}
+	return nil
 }

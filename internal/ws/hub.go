@@ -1,9 +1,12 @@
 package ws
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/Tanish431/worduel/internal/models"
@@ -11,10 +14,15 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		allowed := os.Getenv("FRONTEND_ORIGIN")
+		return origin == allowed || strings.Contains(origin, "localhost")
+	},
 }
 
 type Client struct {
@@ -32,6 +40,12 @@ type Hub struct {
 	unregister chan *Client
 	broadcast  chan roomMsg
 	jwtSecret  string
+	db         *pgxpool.Pool
+}
+
+type Stats struct {
+	ConnectedUsers int `json:"connected_users"`
+	UsersInGame    int `json:"users_in_game"`
 }
 
 type roomMsg struct {
@@ -39,13 +53,14 @@ type roomMsg struct {
 	data    []byte
 }
 
-func NewHub(jwtSecret string) *Hub {
+func NewHub(jwtSecret string, db *pgxpool.Pool) *Hub {
 	return &Hub{
 		rooms:      make(map[uuid.UUID][]*Client),
 		register:   make(chan *Client, 64),
 		unregister: make(chan *Client, 64),
 		broadcast:  make(chan roomMsg, 256),
 		jwtSecret:  jwtSecret,
+		db:         db,
 	}
 }
 
@@ -127,7 +142,6 @@ func (h *Hub) SendToUserInMatch(matchID uuid.UUID, userID uuid.UUID, event model
 }
 
 func (h *Hub) HandleConnect(c *gin.Context) {
-	// Extract user ID from JWT token in query param
 	tokenStr := c.Query("token")
 	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
 		return []byte(h.jwtSecret), nil
@@ -136,12 +150,20 @@ func (h *Hub) HandleConnect(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
+
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
-	userID, err := uuid.Parse(claims["sub"].(string))
+
+	sub, ok := claims["sub"].(string)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	userID, err := uuid.Parse(sub)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
@@ -153,11 +175,30 @@ func (h *Hub) HandleConnect(c *gin.Context) {
 		return
 	}
 
+	// Upgrade FIRST before any further checks
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("ws upgrade: %v", err)
 		return
 	}
+
+	// Participant check AFTER upgrade — send close message on failure
+	lobbyID := uuid.MustParse("00000000-0000-0000-0000-000000000000")
+	if matchID != lobbyID {
+		var count int
+		h.db.QueryRow(context.Background(),
+			`SELECT COUNT(*) FROM matches WHERE id=$1 AND (player_a_id=$2 OR player_b_id=$2)`,
+			matchID, userID,
+		).Scan(&count)
+		if count == 0 {
+			conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(4001, "unauthorized"))
+			conn.Close()
+			return
+		}
+	}
+
+	log.Printf("WS connected: userID=%s matchID=%s", userID, matchID)
 
 	client := &Client{
 		hub:     h,
@@ -168,8 +209,72 @@ func (h *Hub) HandleConnect(c *gin.Context) {
 	}
 
 	h.register <- client
+
+	// If connecting to a specific match (not lobby), send current match state
+	if matchID != lobbyID {
+		var playerAID, playerBID uuid.UUID
+		var gameMode string
+		err := h.db.QueryRow(context.Background(),
+			`SELECT player_a_id, player_b_id, game_mode FROM matches WHERE id=$1`, matchID,
+		).Scan(&playerAID, &playerBID, &gameMode)
+		if err == nil {
+			var opponentID uuid.UUID
+			var opponentUsername string
+			var isPlayerA bool
+			if userID == playerAID {
+				opponentID = playerBID
+				isPlayerA = true
+			} else {
+				opponentID = playerAID
+				isPlayerA = false
+			}
+
+			err = h.db.QueryRow(context.Background(),
+				`SELECT username FROM users WHERE id=$1`, opponentID,
+			).Scan(&opponentUsername)
+
+			if err == nil {
+				event := models.WSEvent{
+					Type: models.EventMatchFound,
+					Payload: map[string]any{
+						"match_id":          matchID.String(),
+						"opponent_id":       opponentID.String(),
+						"opponent_username": opponentUsername,
+						"is_player_a":       isPlayerA,
+						"game_mode":         gameMode,
+					},
+				}
+				data, _ := json.Marshal(event)
+				client.send <- data
+			}
+		}
+	}
+
 	go client.writePump()
 	go client.readPump()
+}
+
+func (h *Hub) Stats() Stats {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	lobbyID := uuid.MustParse("00000000-0000-0000-0000-000000000000")
+	uniqueUsers := make(map[uuid.UUID]bool)
+	inGameUsers := make(map[uuid.UUID]bool)
+
+	for roomID, clients := range h.rooms {
+		for _, c := range clients {
+			uniqueUsers[c.UserID] = true
+			if roomID != lobbyID {
+				inGameUsers[c.UserID] = true
+			}
+		}
+	}
+
+	return Stats{
+		ConnectedUsers: len(uniqueUsers),
+		UsersInGame:    len(inGameUsers),
+	}
 }
 
 func (c *Client) writePump() {

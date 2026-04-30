@@ -2,7 +2,6 @@ package matchmaking
 
 import (
 	"context"
-	"log"
 	"math/rand/v2"
 	"net/http"
 	"time"
@@ -20,9 +19,14 @@ import (
 )
 
 const (
-	queueKey        = "matchmaking:queue"
-	initialELORange = 200
-	queueInterval   = time.Second
+	queueKey          = "matchmaking:queue"
+	guestQueueKey     = "matchmaking:guest_queue"
+	easyQueueKey      = "matchmaking:easy_queue"
+	hardQueueKey      = "matchmaking:hard_queue"
+	guestEasyQueueKey = "matchmaking:guest_easy_queue"
+	guestHardQueueKey = "matchmaking:guest_hard_queue"
+	initialELORange   = 200
+	queueInterval     = time.Second
 )
 
 type Service struct {
@@ -37,6 +41,10 @@ func NewService(db *pgxpool.Pool, rdb *redis.Client, hub *ws.Hub, wordSvc *word.
 	return &Service{db: db, rdb: rdb, hub: hub, wordSvc: wordSvc, gameSvc: gameSvc}
 }
 
+type joinQueueRequest struct {
+	GameMode string `json:"game_mode" binding:"required,oneof=easy hard"`
+}
+
 func (s *Service) HandleJoinQueue(c *gin.Context) {
 	userID, ok := middleware.GetUserID(c)
 	if !ok {
@@ -44,16 +52,32 @@ func (s *Service) HandleJoinQueue(c *gin.Context) {
 		return
 	}
 
+	var req joinQueueRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.GameMode = models.GameModeEasy
+	}
+
 	var eloRating int
+	var isGuest bool
+
 	err := s.db.QueryRow(c.Request.Context(),
-		`SELECT elo FROM users WHERE id=$1`, userID,
-	).Scan(&eloRating)
+		`SELECT elo, is_guest FROM users WHERE id=$1`, userID,
+	).Scan(&eloRating, &isGuest)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
 
-	err = s.rdb.ZAdd(c.Request.Context(), queueKey, redis.Z{
+	key := easyQueueKey
+	if req.GameMode == models.GameModeHard && !isGuest {
+		key = hardQueueKey
+	} else if isGuest && req.GameMode == models.GameModeHard {
+		key = guestHardQueueKey
+	} else if isGuest {
+		key = guestEasyQueueKey
+	}
+
+	err = s.rdb.ZAdd(c.Request.Context(), key, redis.Z{
 		Score:  float64(eloRating),
 		Member: userID.String(),
 	}).Err()
@@ -72,6 +96,11 @@ func (s *Service) HandleLeaveQueue(c *gin.Context) {
 		return
 	}
 	s.rdb.ZRem(c.Request.Context(), queueKey, userID.String())
+	s.rdb.ZRem(c.Request.Context(), guestQueueKey, userID.String())
+	s.rdb.ZRem(c.Request.Context(), easyQueueKey, userID.String())
+	s.rdb.ZRem(c.Request.Context(), hardQueueKey, userID.String())
+	s.rdb.ZRem(c.Request.Context(), guestEasyQueueKey, userID.String())
+	s.rdb.ZRem(c.Request.Context(), guestHardQueueKey, userID.String())
 	c.Status(http.StatusNoContent)
 }
 
@@ -83,14 +112,16 @@ func (s *Service) RunQueue(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.matchPlayers(ctx)
+			s.matchPlayers(ctx, easyQueueKey, true, models.GameModeEasy)
+			s.matchPlayers(ctx, hardQueueKey, true, models.GameModeHard)
+			s.matchPlayers(ctx, guestEasyQueueKey, false, models.GameModeEasy)
+			s.matchPlayers(ctx, guestHardQueueKey, false, models.GameModeHard)
 		}
 	}
 }
 
-func (s *Service) matchPlayers(ctx context.Context) {
-	entries, err := s.rdb.ZRangeWithScores(ctx, queueKey, 0, -1).Result()
-	log.Printf("queue tick: %d players, err=%v", len(entries), err)
+func (s *Service) matchPlayers(ctx context.Context, key string, isRanked bool, gameMode string) {
+	entries, err := s.rdb.ZRangeWithScores(ctx, key, 0, -1).Result()
 	if err != nil || len(entries) < 2 {
 		return
 	}
@@ -98,95 +129,105 @@ func (s *Service) matchPlayers(ctx context.Context) {
 	for i := 0; i < len(entries)-1; i++ {
 		a := entries[i]
 		b := entries[i+1]
-		log.Printf("checking pair: %v (%.0f) vs %v (%.0f)", a.Member, a.Score, b.Member, b.Score)
 		if !elo.WithinRange(int(a.Score), int(b.Score), initialELORange) {
-			log.Printf("elo range exceeded, skipping")
 			continue
 		}
 
 		playerAID, _ := uuid.Parse(a.Member.(string))
 		playerBID, _ := uuid.Parse(b.Member.(string))
 
-		removed, err := s.rdb.ZRem(ctx, queueKey, a.Member, b.Member).Result()
-		log.Printf("zrem result: removed=%d err=%v", removed, err)
+		removed, err := s.rdb.ZRem(ctx, key, a.Member, b.Member).Result()
 		if err != nil || removed != 2 {
 			continue
 		}
 
-		go s.createMatch(ctx, playerAID, playerBID)
+		go s.createMatchWithRanked(ctx, playerAID, playerBID, isRanked, gameMode)
 		i++
 	}
 }
 
-func (s *Service) createMatch(ctx context.Context, playerAID, playerBID uuid.UUID) {
-	log.Printf("creating match: %s vs %s", playerAID, playerBID)
+func (s *Service) createMatchWithRanked(ctx context.Context, playerAID, playerBID uuid.UUID, isRanked bool, gameMode string) {
+	var usernameA, usernameB string
+	s.db.QueryRow(ctx, `SELECT username FROM users WHERE id=$1`, playerAID).Scan(&usernameA)
+	s.db.QueryRow(ctx, `SELECT username FROM users WHERE id=$1`, playerBID).Scan(&usernameB)
+
 	matchID := uuid.New()
 	startIdx := rand.IntN(1000)
 
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO matches
 		 (id, player_a_id, player_b_id, status, player_a_hp, player_b_hp,
-		  player_a_word_idx, player_b_word_idx, is_ranked, started_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		  player_a_word_idx, player_b_word_idx, is_ranked, game_mode, started_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		matchID, playerAID, playerBID, models.MatchActive,
-		models.StartingHP, models.StartingHP, startIdx, startIdx, true, time.Now(),
+		models.StartingHP, models.StartingHP, startIdx, startIdx, isRanked, gameMode, time.Now(),
 	)
 	if err != nil {
-		log.Printf("create match error: %v", err)
 		return
 	}
-	log.Printf("match created: %s", matchID)
 
 	s.hub.SendToUser(playerAID, models.WSEvent{
 		Type: models.EventMatchFound,
 		Payload: map[string]any{
-			"match_id":    matchID.String(),
-			"opponent_id": playerBID.String(),
-			"is_player_a": true,
+			"match_id":          matchID.String(),
+			"opponent_id":       playerBID.String(),
+			"opponent_username": usernameB,
+			"is_player_a":       true,
+			"game_mode":         gameMode,
 		},
 	})
 	s.hub.SendToUser(playerBID, models.WSEvent{
 		Type: models.EventMatchFound,
 		Payload: map[string]any{
-			"match_id":    matchID.String(),
-			"opponent_id": playerAID.String(),
-			"is_player_a": false,
+			"match_id":          matchID.String(),
+			"opponent_id":       playerAID.String(),
+			"opponent_username": usernameA,
+			"is_player_a":       false,
+			"game_mode":         gameMode,
 		},
 	})
 
 	go s.gameSvc.StartDrain(ctx, matchID)
 }
 
-func (s *Service) CreateMatchDirect(ctx context.Context, playerAID, playerBID uuid.UUID, isRanked bool) (uuid.UUID, error) {
+func (s *Service) CreateMatchDirect(ctx context.Context, playerAID, playerBID uuid.UUID, isRanked bool, gameMode string) (uuid.UUID, error) {
 	matchID := uuid.New()
 	startIdx := rand.IntN(1000)
 
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO matches
-		 (id, player_a_id, player_b_id, status, player_a_hp, player_b_hp,
-		  player_a_word_idx, player_b_word_idx, is_ranked, started_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		(id, player_a_id, player_b_id, status, player_a_hp, player_b_hp,
+		player_a_word_idx, player_b_word_idx, is_ranked, game_mode, started_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		matchID, playerAID, playerBID, models.MatchActive,
-		models.StartingHP, models.StartingHP, startIdx, startIdx, isRanked, time.Now(),
+		models.StartingHP, models.StartingHP, startIdx, startIdx, isRanked, gameMode, time.Now(),
 	)
 	if err != nil {
 		return uuid.UUID{}, err
 	}
 
+	var usernameA, usernameB string
+	s.db.QueryRow(ctx, `SELECT username FROM users WHERE id=$1`, playerAID).Scan(&usernameA)
+	s.db.QueryRow(ctx, `SELECT username FROM users WHERE id=$1`, playerBID).Scan(&usernameB)
+
 	s.hub.SendToUser(playerAID, models.WSEvent{
 		Type: models.EventMatchFound,
 		Payload: map[string]any{
-			"match_id":    matchID.String(),
-			"opponent_id": playerBID.String(),
-			"is_player_a": true,
+			"match_id":          matchID.String(),
+			"opponent_id":       playerBID.String(),
+			"opponent_username": usernameB,
+			"is_player_a":       true,
+			"game_mode":         gameMode,
 		},
 	})
 	s.hub.SendToUser(playerBID, models.WSEvent{
 		Type: models.EventMatchFound,
 		Payload: map[string]any{
-			"match_id":    matchID.String(),
-			"opponent_id": playerAID.String(),
-			"is_player_a": false,
+			"match_id":          matchID.String(),
+			"opponent_id":       playerAID.String(),
+			"opponent_username": usernameA,
+			"is_player_a":       false,
+			"game_mode":         gameMode,
 		},
 	})
 

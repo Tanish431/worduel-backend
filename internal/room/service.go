@@ -57,6 +57,14 @@ func (s *Service) HandleJoinRoom(c *gin.Context) {
 
 	code := c.Param("code")
 
+	var req struct {
+		GameMode string `json:"game_mode" binding:"oneof=easy hard"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	var roomID uuid.UUID
 	var hostID uuid.UUID
 	var status string
@@ -86,7 +94,7 @@ func (s *Service) HandleJoinRoom(c *gin.Context) {
 		return
 	}
 
-	matchID, err := s.mmSvc.CreateMatchDirect(context.Background(), hostID, userID, false)
+	matchID, err := s.mmSvc.CreateMatchDirect(context.Background(), hostID, userID, false, req.GameMode)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create match"})
 		return

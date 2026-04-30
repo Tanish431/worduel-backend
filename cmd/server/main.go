@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,6 +12,7 @@ import (
 	"github.com/Tanish431/worduel/internal/auth"
 	"github.com/Tanish431/worduel/internal/challenge"
 	"github.com/Tanish431/worduel/internal/game"
+	"github.com/Tanish431/worduel/internal/history"
 	"github.com/Tanish431/worduel/internal/leaderboard"
 	"github.com/Tanish431/worduel/internal/matchmaking"
 	"github.com/Tanish431/worduel/internal/middleware"
@@ -27,14 +29,15 @@ func main() {
 	db := cfg.MustConnectDB()
 	rdb := cfg.MustConnectRedis()
 
-	hub := ws.NewHub(cfg.JWTSecret)
+	hub := ws.NewHub(cfg.JWTSecret, db)
 	wordSvc := word.NewService(db)
 	gameSvc := game.NewService(db, wordSvc, hub)
 	authSvc := auth.NewService(db, cfg)
 	mmSvc := matchmaking.NewService(db, rdb, hub, wordSvc, gameSvc)
 	roomSvc := room.NewService(db, hub, wordSvc, mmSvc)
-	lbSvc := leaderboard.NewService(db)
 	challengeSvc := challenge.NewService(db, rdb, hub, mmSvc)
+	lbSvc := leaderboard.NewService(db)
+	historySvc := history.NewService(db)
 
 	go hub.Run()
 
@@ -60,6 +63,7 @@ func main() {
 	{
 		api.POST("/auth/register", authSvc.HandleRegister)
 		api.POST("/auth/login", authSvc.HandleLogin)
+		api.POST("/auth/guest", authSvc.HandleGuestLogin)
 		api.GET("/auth/google", authSvc.HandleGoogleLogin)
 		api.GET("/auth/google/callback", authSvc.HandleGoogleCallback)
 	}
@@ -79,11 +83,16 @@ func main() {
 		protected.GET("/leaderboard", lbSvc.HandleGetLeaderboard)
 		protected.POST("/challenge/:username", challengeSvc.HandleChallenge)
 		protected.POST("/challenge/respond", challengeSvc.HandleRespondChallenge)
+		protected.GET("/me/matches", historySvc.HandleGetHistory)
 		protected.POST("/match/:matchID/rematch", challengeSvc.HandleRematch)
 		protected.POST("/match/:matchID/rematch/respond", challengeSvc.HandleRespondRematch)
+		protected.PATCH("/me/username", authSvc.HandleUpdateUsername)
 	}
 
 	r.GET("/ws", hub.HandleConnect)
+	r.GET("/api/stats", func(c *gin.Context) {
+		c.JSON(http.StatusOK, hub.Stats())
+	})
 
 	// Graceful shutdown
 	srv := &gin.Engine{}

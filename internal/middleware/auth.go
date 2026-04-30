@@ -34,7 +34,12 @@ func Auth(secret string) gin.HandlerFunc {
 			return
 		}
 
-		userID, err := uuid.Parse(claims["sub"].(string))
+		sub, ok := claims["sub"].(string)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		userID, err := uuid.Parse(sub)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return

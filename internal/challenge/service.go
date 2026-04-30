@@ -121,7 +121,7 @@ func (s *Service) HandleRespondChallenge(c *gin.Context) {
 		return
 	}
 
-	matchID, err := s.mmSvc.CreateMatchDirect(context.Background(), challengerID, targetID, false)
+	matchID, err := s.mmSvc.CreateMatchDirect(context.Background(), challengerID, targetID, false, models.GameModeEasy)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create match"})
 		return
@@ -178,7 +178,7 @@ func (s *Service) HandleRematch(c *gin.Context) {
 }
 
 func (s *Service) HandleRespondRematch(c *gin.Context) {
-	_, ok := middleware.GetUserID(c)
+	userID, ok := middleware.GetUserID(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"errror": "unauthorized"})
 		return
@@ -206,6 +206,7 @@ func (s *Service) HandleRespondRematch(c *gin.Context) {
 
 	key := "rematch:" + matchID.String() + ":" + requesterID.String()
 	exists, _ := s.rdb.Exists(c.Request.Context(), key).Result()
+
 	if exists == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "rematch request expired or not found"})
 		return
@@ -222,12 +223,25 @@ func (s *Service) HandleRespondRematch(c *gin.Context) {
 	}
 
 	var playerAID, playerBID uuid.UUID
-	s.db.QueryRow(c.Request.Context(),
-		`SELECT player_a_id, player_b_id FROM matches WHERE id=$1`, matchID,
-	).Scan(&playerAID, &playerBID)
+	var gameMode string
+	err = s.db.QueryRow(c.Request.Context(),
+		`SELECT player_a_id, player_b_id, game_mode FROM matches WHERE id=$1`, matchID,
+	).Scan(&playerAID, &playerBID, &gameMode)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "match not found"})
+		return
+	}
+	if userID != playerAID && userID != playerBID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "not a participant"})
+		return
+	}
 
-	// Create new unranked match
-	_, err = s.mmSvc.CreateMatchDirect(context.Background(), playerAID, playerBID, false)
+	// Create new unranked match with acceptor as playerA
+	opponentID := playerBID
+	if userID == playerBID {
+		opponentID = playerAID
+	}
+	_, err = s.mmSvc.CreateMatchDirect(context.Background(), userID, opponentID, false, gameMode)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create match"})
 		return

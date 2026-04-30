@@ -14,6 +14,7 @@ type User struct {
 	AuthProvider   string    `json:"-"`
 	ProviderUserID *string   `json:"-"`
 	ELO            int       `json:"elo"`
+	IsGuest        bool      `json:"is_guest"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
@@ -36,6 +37,7 @@ type Match struct {
 	PlayerAWordIdx int         `json:"player_a_word_idx"`
 	PlayerBWordIdx int         `json:"player_b_word_idx"`
 	IsRanked       bool        `json:"is_ranked"`
+	GameMode       string      `json:"game_mode"`
 	StartedAt      time.Time   `json:"started_at"`
 	FinishedAt     *time.Time  `json:"finished_at,omitempty"`
 }
@@ -46,6 +48,16 @@ const (
 	TileCorrect TileResult = "correct"
 	TilePresent TileResult = "present"
 	TileAbsent  TileResult = "absent"
+)
+
+const (
+	GameModeEasy = "easy"
+	GameModeHard = "hard"
+
+	EasyDrainRate  = 1
+	HardDrainRate  = 1
+	EasyDrainEvery = 2
+	HardDrainEvery = 2
 )
 
 type Guess struct {
