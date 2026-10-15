@@ -2,12 +2,15 @@ package room
 
 import (
 	"context"
+	"errors"
+	"io"
 	"math/rand"
 	"net/http"
 	"time"
 
 	"github.com/Tanish431/worduel/internal/matchmaking"
 	"github.com/Tanish431/worduel/internal/middleware"
+	"github.com/Tanish431/worduel/internal/models"
 	"github.com/Tanish431/worduel/internal/word"
 	"github.com/Tanish431/worduel/internal/ws"
 	"github.com/gin-gonic/gin"
@@ -61,8 +64,14 @@ func (s *Service) HandleJoinRoom(c *gin.Context) {
 		GameMode string `json:"game_mode" binding:"oneof=easy hard"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		req.GameMode = models.GameModeEasy
+	}
+	if req.GameMode == "" {
+		req.GameMode = models.GameModeEasy
 	}
 
 	var roomID uuid.UUID
